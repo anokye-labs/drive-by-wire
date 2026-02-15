@@ -90,6 +90,20 @@ fn tools_list() -> String {
         {"name":"remote_pull","description":"Pull a file from the remote device","inputSchema":{"type":"object","properties":{"remote_path":{"type":"string","description":"Remote file path"},"local_path":{"type":"string","description":"Local destination path"}},"required":["remote_path","local_path"]}},
         {"name":"remote_sysinfo","description":"Get system information from the remote device","inputSchema":{"type":"object","properties":{}}},
         {"name":"remote_ls","description":"List directory contents on the remote device","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Directory path"}},"required":["path"]}},
+        {"name":"remote_install","description":"Install a package on the remote device","inputSchema":{"type":"object","properties":{"package_id":{"type":"string","description":"Package identifier"}},"required":["package_id"]}},
+        {"name":"remote_list_packages","description":"List installed packages on the remote device","inputSchema":{"type":"object","properties":{}}},
+        {"name":"remote_reg_write","description":"Write a registry value on the remote device","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Registry path"},"name":{"type":"string","description":"Value name"},"value":{"type":"string","description":"Value data"},"kind":{"type":"string","description":"Value type (e.g. REG_SZ, REG_DWORD)"}},"required":["path","name","value","kind"]}},
+        {"name":"remote_reg_read","description":"Read a registry value from the remote device","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Registry path"},"name":{"type":"string","description":"Value name"}},"required":["path","name"]}},
+        {"name":"remote_reg_delete","description":"Delete a registry value on the remote device","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Registry path"},"name":{"type":"string","description":"Value name"}},"required":["path","name"]}},
+        {"name":"remote_service","description":"Control a Windows service on the remote device","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Service name"},"action":{"type":"string","description":"Action (start, stop, restart, status)"}},"required":["name","action"]}},
+        {"name":"remote_env","description":"Set an environment variable on the remote device","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"Variable name"},"value":{"type":"string","description":"Variable value"},"scope":{"type":"string","description":"Scope (user, machine)"}},"required":["name","value","scope"]}},
+        {"name":"remote_enable_rdp","description":"Enable Remote Desktop on the remote device","inputSchema":{"type":"object","properties":{}}},
+        {"name":"remote_enable_ssh","description":"Enable SSH on the remote device","inputSchema":{"type":"object","properties":{}}},
+        {"name":"remote_set_hostname","description":"Set the hostname of the remote device","inputSchema":{"type":"object","properties":{"name":{"type":"string","description":"New hostname"}},"required":["name"]}},
+        {"name":"remote_set_power","description":"Set the power plan on the remote device","inputSchema":{"type":"object","properties":{"plan":{"type":"string","description":"Power plan","enum":["high_performance","balanced"]}},"required":["plan"]}},
+        {"name":"remote_reboot","description":"Reboot the remote device","inputSchema":{"type":"object","properties":{"delay_secs":{"type":"integer","description":"Delay before reboot in seconds"}}}},
+        {"name":"remote_create_user","description":"Create a user account on the remote device","inputSchema":{"type":"object","properties":{"username":{"type":"string","description":"Username"},"password":{"type":"string","description":"Password"},"admin":{"type":"boolean","description":"Grant admin privileges"}},"required":["username","password"]}},
+        {"name":"remote_script","description":"Execute a sequence of commands on the remote device","inputSchema":{"type":"object","properties":{"commands":{"type":"array","items":{"type":"string"},"description":"Commands to execute"},"continue_on_error":{"type":"boolean","description":"Continue on error"}},"required":["commands"]}},
         {"name":"connect_status","description":"Check USB connection status and list connected devices","inputSchema":{"type":"object","properties":{}}}
     ]"#.to_string()
 }
@@ -232,23 +246,193 @@ fn call_tool(name: &str, args: &str, peer_ip: &str) -> String {
         }
         "remote_ls" => {
             let path = json_str_field(args, "path").unwrap_or_else(|| "C:\\".into());
-            match connect_peer(peer_ip) {
-                Ok((mut r, mut w)) => {
-                    let msg = format!(
-                        r#"{{"type":"ls","id":"mcp","path":"{}"}}"#,
-                        path.replace('\\', "\\\\").replace('"', "\\\"")
-                    );
-                    protocol::write_message(&mut w, &msg).unwrap();
-                    match protocol::read_message(&mut r) {
-                        Ok(resp) => resp,
-                        Err(e) => format!("read error: {}", e),
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"ls","id":"mcp","path":"{}"}}"#,
+                path.replace('\\', "\\\\").replace('"', "\\\"")
+            ))
+        }
+        "remote_install" => {
+            let pkg = json_str_field(args, "package_id").unwrap_or_default();
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"winget_install","id":"mcp","package_id":"{}"}}"#,
+                pkg.replace('"', "\\\"")
+            ))
+        }
+        "remote_list_packages" => {
+            send_simple(peer_ip, r#"{"type":"winget_list","id":"mcp"}"#)
+        }
+        "remote_reg_write" => {
+            let path = json_str_field(args, "path").unwrap_or_default();
+            let name = json_str_field(args, "name").unwrap_or_default();
+            let value = json_str_field(args, "value").unwrap_or_default();
+            let kind = json_str_field(args, "kind").unwrap_or_else(|| "REG_SZ".into());
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"reg_write","id":"mcp","path":"{}","name":"{}","value":"{}","kind":"{}"}}"#,
+                path.replace('\\', "\\\\").replace('"', "\\\""),
+                name.replace('"', "\\\""),
+                value.replace('\\', "\\\\").replace('"', "\\\""),
+                kind
+            ))
+        }
+        "remote_reg_read" => {
+            let path = json_str_field(args, "path").unwrap_or_default();
+            let name = json_str_field(args, "name").unwrap_or_default();
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"reg_read","id":"mcp","path":"{}","name":"{}"}}"#,
+                path.replace('\\', "\\\\").replace('"', "\\\""),
+                name.replace('"', "\\\"")
+            ))
+        }
+        "remote_reg_delete" => {
+            let path = json_str_field(args, "path").unwrap_or_default();
+            let name = json_str_field(args, "name").unwrap_or_default();
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"reg_delete","id":"mcp","path":"{}","name":"{}"}}"#,
+                path.replace('\\', "\\\\").replace('"', "\\\""),
+                name.replace('"', "\\\"")
+            ))
+        }
+        "remote_service" => {
+            let name = json_str_field(args, "name").unwrap_or_default();
+            let action = json_str_field(args, "action").unwrap_or_default();
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"service","id":"mcp","name":"{}","action":"{}"}}"#,
+                name.replace('"', "\\\""), action
+            ))
+        }
+        "remote_env" => {
+            let name = json_str_field(args, "name").unwrap_or_default();
+            let value = json_str_field(args, "value").unwrap_or_default();
+            let scope = json_str_field(args, "scope").unwrap_or_else(|| "machine".into());
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"env_set","id":"mcp","name":"{}","value":"{}","scope":"{}"}}"#,
+                name.replace('"', "\\\""),
+                value.replace('\\', "\\\\").replace('"', "\\\""),
+                scope
+            ))
+        }
+        "remote_enable_rdp" => {
+            send_simple(peer_ip, r#"{"type":"enable_rdp","id":"mcp"}"#)
+        }
+        "remote_enable_ssh" => {
+            send_simple(peer_ip, r#"{"type":"enable_ssh","id":"mcp"}"#)
+        }
+        "remote_set_hostname" => {
+            let name = json_str_field(args, "name").unwrap_or_default();
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"set_hostname","id":"mcp","name":"{}"}}"#,
+                name.replace('"', "\\\"")
+            ))
+        }
+        "remote_set_power" => {
+            let plan = json_str_field(args, "plan").unwrap_or_else(|| "balanced".into());
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"set_power","id":"mcp","plan":"{}"}}"#, plan
+            ))
+        }
+        "remote_reboot" => {
+            let delay = json_u64_field(args, "delay_secs").unwrap_or(5);
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"reboot","id":"mcp","delay_secs":{}}}"#, delay
+            ))
+        }
+        "remote_create_user" => {
+            let username = json_str_field(args, "username").unwrap_or_default();
+            let password = json_str_field(args, "password").unwrap_or_default();
+            let admin = args.contains("\"admin\":true");
+            send_simple(peer_ip, &format!(
+                r#"{{"type":"create_user","id":"mcp","username":"{}","password":"{}","admin":{}}}"#,
+                username.replace('"', "\\\""),
+                password.replace('"', "\\\""),
+                admin
+            ))
+        }
+        "remote_script" => {
+            // Execute commands sequentially via exec
+            let continue_on_error = args.contains("\"continue_on_error\":true");
+            // Extract commands array — simple parsing
+            let commands = extract_string_array(args, "commands");
+            let mut results = Vec::new();
+            for cmd in &commands {
+                match connect_peer(peer_ip) {
+                    Ok((mut r, mut w)) => {
+                        let msg = format!(r#"{{"type":"exec","id":"mcp","cmd":"{}"}}"#,
+                            cmd.replace('\\', "\\\\").replace('"', "\\\""));
+                        protocol::write_message(&mut w, &msg).unwrap();
+                        match protocol::read_message(&mut r) {
+                            Ok(resp) => {
+                                let code = json_u64_field(&resp, "exit_code").unwrap_or(0);
+                                let stdout = json_str_field(&resp, "stdout").unwrap_or_default();
+                                let stderr = json_str_field(&resp, "stderr").unwrap_or_default();
+                                results.push(format!("$ {}\n{}{}", cmd, stdout.trim_end(),
+                                    if stderr.trim().is_empty() { String::new() } else { format!("\nSTDERR: {}", stderr.trim_end()) }));
+                                if code != 0 && !continue_on_error {
+                                    results.push(format!("[stopped at exit code {}]", code));
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                results.push(format!("$ {}\nerror: {}", cmd, e));
+                                if !continue_on_error { break; }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        results.push(format!("$ {}\nconnection failed: {}", cmd, e));
+                        if !continue_on_error { break; }
                     }
                 }
-                Err(e) => format!("connection failed: {}", e),
             }
+            results.join("\n\n")
         }
         _ => format!("unknown tool: {}", name),
     }
+}
+
+fn send_simple(peer_ip: &str, msg: &str) -> String {
+    match connect_peer(peer_ip) {
+        Ok((mut r, mut w)) => {
+            protocol::write_message(&mut w, msg).unwrap();
+            match protocol::read_message(&mut r) {
+                Ok(resp) => resp,
+                Err(e) => format!("read error: {}", e),
+            }
+        }
+        Err(e) => format!("connection failed: {}", e),
+    }
+}
+
+fn extract_string_array(json: &str, field: &str) -> Vec<String> {
+    let pattern = format!(r#""{}":"#, field);
+    let start = match json.find(&pattern) {
+        Some(p) => p + pattern.len(),
+        None => return Vec::new(),
+    };
+    let rest = &json[start..].trim_start();
+    if !rest.starts_with('[') { return Vec::new(); }
+    let mut items = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut current = String::new();
+    let mut depth = 0;
+    for ch in rest.chars() {
+        if escaped { escaped = false; current.push(ch); continue; }
+        match ch {
+            '\\' if in_string => { escaped = true; }
+            '"' => {
+                in_string = !in_string;
+                if !in_string && depth == 1 {
+                    items.push(current.clone());
+                    current.clear();
+                }
+            }
+            '[' if !in_string => { depth += 1; }
+            ']' if !in_string => { depth -= 1; if depth == 0 { break; } }
+            _ if in_string => { current.push(ch); }
+            _ => {}
+        }
+    }
+    items
 }
 
 fn connect_peer(ip: &str) -> io::Result<(BufReader<TcpStream>, BufWriter<TcpStream>)> {

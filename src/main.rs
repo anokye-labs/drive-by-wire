@@ -160,6 +160,185 @@ fn handle_connection(stream: TcpStream) {
                 println!("  sysinfo");
                 handle_sysinfo(&id)
             }
+            "reg_read" => {
+                let path = json_str_field(&msg, "path").unwrap_or_default();
+                let name = json_str_field(&msg, "name").unwrap_or_default();
+                println!("  reg_read: {}\\{}", path, name);
+                let cmd = format!("(Get-ItemProperty '{}' -Name '{}' -ErrorAction Stop).'{}'", path, name, name);
+                let (code, stdout, stderr) = executor::exec(&cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"reg_result","id":"{}","value":{}}}"#, id, json_escape(stdout.trim()))
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "reg_write" => {
+                let path = json_str_field(&msg, "path").unwrap_or_default();
+                let name = json_str_field(&msg, "name").unwrap_or_default();
+                let value = json_str_field(&msg, "value").unwrap_or_default();
+                let kind = json_str_field(&msg, "kind").unwrap_or_else(|| "String".into());
+                println!("  reg_write: {}\\{} = {}", path, name, value);
+                let ps_type = match kind.as_str() {
+                    "REG_DWORD" | "DWord" => "DWord",
+                    "REG_QWORD" | "QWord" => "QWord",
+                    "REG_EXPAND_SZ" | "ExpandString" => "ExpandString",
+                    "REG_MULTI_SZ" | "MultiString" => "MultiString",
+                    _ => "String",
+                };
+                let cmd = format!(
+                    "New-ItemProperty -Path '{}' -Name '{}' -Value '{}' -PropertyType {} -Force | Out-Null",
+                    path, name, value, ps_type
+                );
+                let (code, _, stderr) = executor::exec(&cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "reg_delete" => {
+                let path = json_str_field(&msg, "path").unwrap_or_default();
+                let name = json_str_field(&msg, "name").unwrap_or_default();
+                println!("  reg_delete: {}\\{}", path, name);
+                let cmd = format!("Remove-ItemProperty -Path '{}' -Name '{}' -Force -ErrorAction Stop", path, name);
+                let (code, _, stderr) = executor::exec(&cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "service" => {
+                let name = json_str_field(&msg, "name").unwrap_or_default();
+                let action = json_str_field(&msg, "action").unwrap_or_default();
+                println!("  service: {} {}", action, name);
+                let cmd = match action.as_str() {
+                    "start" => format!("Start-Service '{}' -ErrorAction Stop; Get-Service '{}'", name, name),
+                    "stop" => format!("Stop-Service '{}' -Force -ErrorAction Stop; Get-Service '{}'", name, name),
+                    "restart" => format!("Restart-Service '{}' -Force -ErrorAction Stop; Get-Service '{}'", name, name),
+                    "status" => format!("Get-Service '{}'", name),
+                    _ => format!("echo 'unknown action: {}'", action),
+                };
+                let (code, stdout, stderr) = executor::exec(&cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"exec_result","id":"{}","exit_code":0,"stdout":{},"stderr":""}}"#, id, json_escape(stdout.trim()))
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "env_set" => {
+                let name = json_str_field(&msg, "name").unwrap_or_default();
+                let value = json_str_field(&msg, "value").unwrap_or_default();
+                let scope = json_str_field(&msg, "scope").unwrap_or_else(|| "machine".into());
+                println!("  env_set: {} = {} ({})", name, value, scope);
+                let target = if scope == "user" { "User" } else { "Machine" };
+                let cmd = format!("[Environment]::SetEnvironmentVariable('{}', '{}', '{}')", name, value, target);
+                let (code, _, stderr) = executor::exec(&cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "reboot" => {
+                let delay = json_u64_field(&msg, "delay_secs").unwrap_or(5);
+                println!("  reboot in {} seconds", delay);
+                let cmd = format!("shutdown /r /t {}", delay);
+                let (_, _, _) = executor::exec(&cmd, None);
+                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+            }
+            "enable_rdp" => {
+                println!("  enable_rdp");
+                let cmd = concat!(
+                    "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force; ",
+                    "Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue; ",
+                    "Write-Output 'RDP enabled'"
+                );
+                let (code, stdout, stderr) = executor::exec(cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "enable_ssh" => {
+                println!("  enable_ssh");
+                let cmd = concat!(
+                    "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue; ",
+                    "Start-Service sshd -ErrorAction SilentlyContinue; ",
+                    "Set-Service -Name sshd -StartupType Automatic; ",
+                    "New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue; ",
+                    "Write-Output 'SSH enabled'"
+                );
+                let (code, stdout, stderr) = executor::exec(cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "set_hostname" => {
+                let name = json_str_field(&msg, "name").unwrap_or_default();
+                println!("  set_hostname: {}", name);
+                let cmd = format!("Rename-Computer -NewName '{}' -Force", name);
+                let (code, _, stderr) = executor::exec(&cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"ack","id":"{}","message":"Reboot required for hostname change"}}"#, id)
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "set_power" => {
+                let plan = json_str_field(&msg, "plan").unwrap_or_default();
+                println!("  set_power: {}", plan);
+                let guid = match plan.as_str() {
+                    "high_performance" => "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+                    _ => "381b4222-f694-41f0-9685-ff5bb260df2e", // balanced
+                };
+                let cmd = format!("powercfg /setactive {}", guid);
+                let (code, _, stderr) = executor::exec(&cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "create_user" => {
+                let username = json_str_field(&msg, "username").unwrap_or_default();
+                let password = json_str_field(&msg, "password").unwrap_or_default();
+                let admin = msg.contains("\"admin\":true");
+                println!("  create_user: {} (admin={})", username, admin);
+                let mut cmd = format!(
+                    "net user '{}' '{}' /add", username, password
+                );
+                if admin {
+                    cmd.push_str(&format!("; net localgroup Administrators '{}' /add", username));
+                }
+                let (code, stdout, stderr) = executor::exec(&cmd, None);
+                if code == 0 {
+                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+                } else {
+                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+                }
+            }
+            "winget_install" => {
+                let package = json_str_field(&msg, "package_id").unwrap_or_default();
+                println!("  winget_install: {}", package);
+                let cmd = format!("winget install '{}' --silent --accept-package-agreements --accept-source-agreements", package);
+                let (code, stdout, stderr) = executor::exec(&cmd, None);
+                format!(
+                    r#"{{"type":"exec_result","id":"{}","exit_code":{},"stdout":{},"stderr":{}}}"#,
+                    id, code, json_escape(stdout.trim()), json_escape(stderr.trim())
+                )
+            }
+            "winget_list" => {
+                println!("  winget_list");
+                let (code, stdout, stderr) = executor::exec("winget list", None);
+                format!(
+                    r#"{{"type":"exec_result","id":"{}","exit_code":{},"stdout":{},"stderr":{}}}"#,
+                    id, code, json_escape(stdout.trim()), json_escape(stderr.trim())
+                )
+            }
             _ => {
                 format!(r#"{{"type":"error","id":"{}","message":"unknown message type: {}"}}"#, id, msg_type)
             }
