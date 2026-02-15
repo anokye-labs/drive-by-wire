@@ -10,12 +10,67 @@ fn main() {
         connect(&args[2]);
     } else {
         // Default: listen mode (double-click friendly)
-        println!("drive-by-wire — waiting for connection on port {}...", PORT);
+        print_local_ips();
+        println!("\nListening on port {}... waiting for connection", PORT);
         listen();
     }
 }
 
+fn print_local_ips() {
+    use std::net::UdpSocket;
+    println!("=== Local IP addresses ===");
+    // Bind a UDP socket to find routable interfaces
+    if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+        // Get all local addresses by iterating interfaces
+        // Simple approach: just show what we can find
+    }
+    // Use hostname resolution to find all IPs
+    if let Ok(hostname) = std::process::Command::new("hostname").output() {
+        let name = String::from_utf8_lossy(&hostname.stdout).trim().to_string();
+        println!("Hostname: {}", name);
+    }
+    // Run ipconfig and extract relevant info
+    if let Ok(output) = std::process::Command::new("ipconfig").output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut capture = false;
+        for line in text.lines() {
+            let lower = line.to_lowercase();
+            if lower.contains("usb4") || lower.contains("thunderbolt") || lower.contains("p2p") {
+                capture = true;
+                println!("{}", line.trim());
+            } else if capture {
+                if line.trim().is_empty() || (!line.starts_with(' ') && !line.starts_with('\t')) {
+                    if !line.trim().is_empty() && !lower.contains("ipv") && !lower.contains("subnet") && !lower.contains("link-local") && !lower.contains("default") {
+                        capture = false;
+                    }
+                }
+                if capture {
+                    println!("{}", line.trim());
+                }
+            }
+        }
+    }
+    // Also print all 169.254.x.x addresses
+    if let Ok(output) = std::process::Command::new("ipconfig").output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            if line.contains("169.254.") {
+                println!("Link-local: {}", line.trim());
+            }
+        }
+    }
+}
+
 fn listen() {
+    // Add firewall rule for this exe so connections aren't blocked
+    let exe = std::env::current_exe().unwrap_or_default();
+    let _ = std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "add", "rule",
+               "name=drive-by-wire", "dir=in", "action=allow",
+               &format!("program={}", exe.display()),
+               "protocol=tcp", &format!("localport={}", PORT)])
+        .output();
+
     let addr = format!("0.0.0.0:{}", PORT);
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
