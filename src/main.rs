@@ -30,6 +30,10 @@ fn main() {
         Some("connect") if args.len() > 2 => {
             pilot_echo(&args[2]);
         }
+        Some("deploy") if args.len() > 2 => {
+            // deploy <ip> — push this binary to passenger and restart it
+            pilot_deploy(&args[2]);
+        }
         _ => {
             // Default: passenger mode (double-click friendly)
             print_local_ips();
@@ -517,4 +521,80 @@ fn pilot_pull(ip: &str, remote_path: &str, local_path: &str) {
         let err = json_str_field(&resp, "message").unwrap_or_default();
         eprintln!("Pull failed: {}", err);
     }
+}
+
+fn pilot_deploy(ip: &str) {
+    let exe_dir = std::env::current_exe().unwrap();
+    let project_dir = exe_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+    let x64_path = project_dir.join("target").join("x86_64-pc-windows-msvc").join("release").join("drive-by-wire.exe");
+
+    let src = if x64_path.exists() {
+        x64_path
+    } else {
+        exe_dir.clone()
+    };
+
+    let data = std::fs::read(&src).expect("failed to read binary");
+    println!("Deploying {} ({} bytes) to {}...", src.display(), data.len(), ip);
+
+    let remote_tmp = r"C:\drive-by-wire\drive-by-wire-new.exe";
+    let remote_exe = r"C:\drive-by-wire\drive-by-wire.exe";
+
+    // Ensure directory exists
+    {
+        let (mut reader, mut writer) = pilot_connect(ip);
+        let mkdir = r#"{"type":"exec","id":"1","cmd":"New-Item -ItemType Directory -Path C:\\drive-by-wire -Force | Out-Null"}"#;
+        protocol::write_message(&mut writer, mkdir).unwrap();
+        let _ = protocol::read_message(&mut reader);
+    }
+
+    // Push binary to temp location
+    {
+        let (mut reader, mut writer) = pilot_connect(ip);
+        let msg = format!(
+            r#"{{"type":"push","id":"1","dest_path":"{}","size":{}}}"#,
+            remote_tmp.replace('\\', "\\\\"), data.len()
+        );
+        protocol::write_message(&mut writer, &msg).unwrap();
+        protocol::write_raw_bytes(&mut writer, &data).unwrap();
+        let resp = protocol::read_message(&mut reader).unwrap();
+        if json_str_field(&resp, "type").unwrap_or_default() != "ack" {
+            eprintln!("Push failed: {}", json_str_field(&resp, "message").unwrap_or_default());
+            return;
+        }
+        println!("Binary pushed successfully.");
+    }
+
+    // Stop old passenger, swap binary, start new one
+    println!("Restarting passenger...");
+    {
+        let (mut reader, mut writer) = pilot_connect(ip);
+        let cmd = format!(
+            "Stop-Process -Name drive-by-wire -Force -ErrorAction SilentlyContinue; Stop-Process -Name drive-by-wire-x64 -Force -ErrorAction SilentlyContinue; Start-Sleep 1; if (Test-Path '{}') {{ Remove-Item '{}' -Force }}; Move-Item '{}' '{}' -Force; Start-Process '{}'",
+            remote_exe, remote_exe, remote_tmp, remote_exe, remote_exe
+        );
+        let msg = format!(
+            r#"{{"type":"exec","id":"1","cmd":"{}"}}"#,
+            cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        protocol::write_message(&mut writer, &msg).unwrap();
+        // Will likely fail as we kill the process serving us
+        let _ = protocol::read_message(&mut reader);
+    }
+
+    // Wait for new passenger
+    println!("Waiting for new passenger...");
+    for i in 0..15 {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let addr = format!("{}:{}", ip, PORT);
+        if let Ok(s) = std::net::TcpStream::connect_timeout(
+            &addr.parse::<std::net::SocketAddr>().unwrap(),
+            std::time::Duration::from_secs(3),
+        ) {
+            drop(s);
+            println!("New passenger is up! (attempt {})", i + 1);
+            return;
+        }
+    }
+    eprintln!("Passenger did not come back within 30 seconds.");
 }
