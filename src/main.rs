@@ -6,20 +6,26 @@ const PORT: u16 = 7842;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() > 1 && args[1] == "listen" {
-        listen();
-    } else if args.len() > 2 && args[1] == "connect" {
+    if args.len() > 2 && args[1] == "connect" {
         connect(&args[2]);
     } else {
-        eprintln!("Usage:");
-        eprintln!("  drive-by-wire listen              # run on target PC");
-        eprintln!("  drive-by-wire connect <ip>         # run on this PC");
+        // Default: listen mode (double-click friendly)
+        println!("drive-by-wire — waiting for connection on port {}...", PORT);
+        listen();
     }
 }
 
 fn listen() {
     let addr = format!("0.0.0.0:{}", PORT);
-    let listener = TcpListener::bind(&addr).expect("bind failed");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind {}: {}", addr, e);
+            eprintln!("Press Enter to exit...");
+            let _ = std::io::stdin().read_line(&mut String::new());
+            return;
+        }
+    };
     println!("Listening on {}", addr);
 
     for stream in listener.incoming() {

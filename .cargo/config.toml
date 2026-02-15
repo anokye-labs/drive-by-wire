@@ -1,10 +1,16 @@
 [target.aarch64-pc-windows-msvc]
 linker = "C:\\Users\\hoops\\src\\anokye\\usb-bridge-abandoned\\tools\\link.exe"
-
-[build]
 rustflags = [
     "-C", "link-arg=/defaultlib:libvcruntime",
     "-C", "link-arg=/LIBPATH:C:\\Users\\hoops\\src\\anokye\\usb-bridge-abandoned\\tools\\crt",
     "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\arm64",
     "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\arm64",
+]
+
+[target.x86_64-pc-windows-msvc]
+linker = "C:\\Users\\hoops\\src\\anokye\\usb-bridge-abandoned\\tools\\link.exe"
+rustflags = [
+    "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64",
+    "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64",
+    "-C", "link-arg=/LIBPATH:C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64",
 ]
