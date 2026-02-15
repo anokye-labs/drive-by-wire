@@ -1,6 +1,7 @@
 mod protocol;
 mod executor;
 mod mcp;
+mod discover;
 
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
@@ -14,6 +15,16 @@ fn main() {
         Some("mcp") if args.len() > 2 => {
             // mcp <peer_ip> — run as MCP server on stdio
             mcp::run(&args[2]);
+        }
+        Some("mcp") => {
+            // mcp (no IP) — auto-discover peer, then run MCP server
+            match discover::find_peer() {
+                Some(ip) => mcp::run(&ip),
+                None => {
+                    eprintln!("ERROR: Could not find passenger. Is the USB cable connected?");
+                    std::process::exit(1);
+                }
+            }
         }
         Some("exec") if args.len() > 3 => {
             let cmd = args[3..].join(" ");
@@ -33,6 +44,16 @@ fn main() {
         Some("deploy") if args.len() > 2 => {
             // deploy <ip> — push this binary to passenger and restart it
             pilot_deploy(&args[2]);
+        }
+        Some("discover") => {
+            // discover — find peer on USB4/Thunderbolt P2P link
+            match discover::find_peer() {
+                Some(ip) => println!("Peer found: {}", ip),
+                None => {
+                    println!("No peer found. Is the USB cable connected?");
+                    std::process::exit(1);
+                }
+            }
         }
         _ => {
             // Default: passenger mode (double-click friendly)
