@@ -32,6 +32,11 @@ impl Auth {
         &self.pin
     }
 
+    /// Check if any device has ever been paired.
+    pub fn has_any_paired(&self) -> bool {
+        !self.paired_tokens.is_empty()
+    }
+
     /// Check if a token is already paired (trusted).
     pub fn is_paired(&self, token: &str) -> bool {
         self.paired_tokens.iter().any(|t| t == token)

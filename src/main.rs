@@ -237,12 +237,43 @@ fn handle_connection_secure(
             }
         }
         _ => {
-            // No auth message — reject
-            let resp = r#"{"type":"auth_required","message":"send auth first"}"#;
-            protocol::write_message(&mut writer, resp).ok();
-            tx.send(tui::TuiEvent::AuthFailed(peer.to_string())).ok();
-            logger::log_auth(peer, "no auth message");
-            false
+            // Non-auth message received.
+            // If no one has ever paired, allow the connection (TOFU model).
+            let has_paired = auth.lock().unwrap().has_any_paired();
+            if !has_paired {
+                tx.send(tui::TuiEvent::AuthSuccess(peer.to_string())).ok();
+                logger::log_auth(peer, "allowed (no paired devices yet — TOFU)");
+                // Process this first message as a command after auth
+                // We need to handle it inline since we already consumed it
+                let msg_type_inner = json_str_field(&first_msg, "type").unwrap_or_default();
+                let id = json_str_field(&first_msg, "id").unwrap_or_default();
+                let tier = security::classify(&msg_type_inner);
+                let tier_str = match tier {
+                    security::Tier::Auto => "auto",
+                    security::Tier::Log => "log",
+                    security::Tier::Confirm => "confirm",
+                };
+                logger::log_command(peer, &msg_type_inner, &first_msg, tier_str);
+
+                if msg_type_inner == "pull" {
+                    let src = json_str_field(&first_msg, "src_path").unwrap_or_default();
+                    if let Ok(data) = std::fs::read(&src) {
+                        let header = format!(r#"{{"type":"file_data","id":"{}","size":{}}}"#, id, data.len());
+                        let _ = protocol::write_message(&mut writer, &header);
+                        let _ = protocol::write_raw_bytes(&mut writer, &data);
+                    }
+                } else {
+                    let response = dispatch_command(&msg_type_inner, &id, &first_msg, &mut reader);
+                    let _ = protocol::write_message(&mut writer, &response);
+                }
+                true // continue to process more commands
+            } else {
+                let resp = r#"{"type":"auth_required","message":"send auth first"}"#;
+                protocol::write_message(&mut writer, resp).ok();
+                tx.send(tui::TuiEvent::AuthFailed(peer.to_string())).ok();
+                logger::log_auth(peer, "no auth message");
+                false
+            }
         }
     };
 
@@ -842,6 +873,49 @@ fn pilot_deploy(ip: &str) {
             return;
         }
         println!("Binary pushed successfully.");
+    }
+
+    // Pre-provision auth: generate a token, push paired.json to passenger,
+    // save the same token as our pilot token — so the new passenger trusts us
+    let token = format!("{:016x}{:016x}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        std::process::id() as u128 * 31337
+    );
+    let paired_json = format!(r#"["{}"]"#, token);
+    {
+        let (mut reader, mut writer) = pilot_connect(ip);
+        let home_cmd = r#"{"type":"exec","id":"1","cmd":"$env:USERPROFILE"}"#;
+        protocol::write_message(&mut writer, home_cmd).unwrap();
+        let resp = protocol::read_message(&mut reader).unwrap();
+        let remote_home = json_str_field(&resp, "stdout").unwrap_or_else(|| r"C:\Users\Public".into());
+        let remote_home = remote_home.trim().trim_end_matches('\r');
+        let config_dir = format!(r"{}\.drive-by-wire", remote_home);
+
+        // Create config dir and write paired.json
+        let (mut r2, mut w2) = pilot_connect(ip);
+        let mkdir_cmd = format!(
+            r#"{{"type":"exec","id":"1","cmd":"New-Item -ItemType Directory -Path '{}' -Force | Out-Null"}}"#,
+            config_dir.replace('\\', "\\\\")
+        );
+        protocol::write_message(&mut w2, &mkdir_cmd).unwrap();
+        let _ = protocol::read_message(&mut r2);
+
+        let paired_path = format!(r"{}\paired.json", config_dir);
+        let paired_data = paired_json.as_bytes();
+        let (mut r3, mut w3) = pilot_connect(ip);
+        let push_msg = format!(
+            r#"{{"type":"push","id":"1","dest_path":"{}","size":{}}}"#,
+            paired_path.replace('\\', "\\\\"), paired_data.len()
+        );
+        protocol::write_message(&mut w3, &push_msg).unwrap();
+        protocol::write_raw_bytes(&mut w3, paired_data).unwrap();
+        let resp = protocol::read_message(&mut r3).unwrap();
+        if json_str_field(&resp, "type").unwrap_or_default() == "ack" {
+            save_pilot_token(&token);
+            println!("Auth pre-provisioned (token saved).");
+        } else {
+            println!("Warning: could not pre-provision auth. You'll need to pair manually.");
+        }
     }
 
     // Stop old passenger, swap binary, start new one
