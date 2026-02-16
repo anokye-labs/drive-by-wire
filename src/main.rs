@@ -869,7 +869,15 @@ fn pilot_pull(ip: &str, remote_path: &str, local_path: &str) {
 
 fn pilot_deploy(ip: &str) {
     let exe_dir = std::env::current_exe().unwrap();
-    let project_dir = exe_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+    // Navigate to project root: exe is at target/<triple>/release/drive-by-wire.exe
+    // or target/release/drive-by-wire.exe — try both
+    let project_dir = {
+        let p3 = exe_dir.parent().unwrap().parent().unwrap().parent().unwrap();
+        let p4 = p3.parent().unwrap_or(p3);
+        // If p3/Cargo.toml exists, that's the root; otherwise try p4
+        if p3.join("Cargo.toml").exists() { p3.to_path_buf() }
+        else { p4.to_path_buf() }
+    };
     let x64_path = project_dir.join("target").join("x86_64-pc-windows-msvc").join("release").join("drive-by-wire.exe");
 
     let src = if x64_path.exists() {
