@@ -446,37 +446,34 @@ fn connect_peer(ip: &str) -> io::Result<(BufReader<TcpStream>, BufWriter<TcpStre
 
     // Authenticate
     let token = load_pilot_token();
-    let auth_msg = if let Some(ref tok) = token {
-        format!(r#"{{"type":"auth","token":"{}"}}"#, tok)
-    } else {
-        // No token — try without auth (for legacy passengers)
-        return Ok((reader, writer));
-    };
+    if let Some(ref tok) = token {
+        let auth_msg = format!(r#"{{"type":"auth","token":"{}"}}"#, tok);
+        crate::protocol::write_message(&mut writer, &auth_msg)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("auth write: {}", e)))?;
 
-    crate::protocol::write_message(&mut writer, &auth_msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("auth write: {}", e)))?;
+        let resp = crate::protocol::read_message(&mut reader)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("auth read: {}", e)))?;
 
-    let resp = crate::protocol::read_message(&mut reader)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("auth read: {}", e)))?;
-
-    let resp_type = crate::json_str_field(&resp, "type").unwrap_or_default();
-    match resp_type.as_str() {
-        "auth_ok" => {
-            // Check if passenger sent us a new token (from PIN pairing)
-            if let Some(new_tok) = crate::json_str_field(&resp, "token") {
-                save_pilot_token(&new_tok);
+        let resp_type = crate::json_str_field(&resp, "type").unwrap_or_default();
+        match resp_type.as_str() {
+            "auth_ok" => {
+                if let Some(new_tok) = crate::json_str_field(&resp, "token") {
+                    save_pilot_token(&new_tok);
+                }
+                Ok((reader, writer))
             }
-            Ok((reader, writer))
+            "auth_required" | "auth_failed" => {
+                let msg = crate::json_str_field(&resp, "message").unwrap_or_else(|| "auth failed".into());
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, msg))
+            }
+            _ => {
+                Ok((reader, writer))
+            }
         }
-        "auth_required" | "auth_failed" => {
-            let msg = crate::json_str_field(&resp, "message").unwrap_or_else(|| "auth failed".into());
-            Err(io::Error::new(io::ErrorKind::PermissionDenied, msg))
-        }
-        _ => {
-            // Legacy passenger that doesn't understand auth — treat response as data
-            // Put the response back... actually we can't. For legacy compat, just proceed.
-            Ok((reader, writer))
-        }
+    } else {
+        // No token — can't authenticate
+        Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "No auth token. Pair first: drive-by-wire pair <ip> <pin>"))
     }
 }
 

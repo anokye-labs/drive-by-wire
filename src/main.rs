@@ -64,6 +64,23 @@ fn main() {
             // pair <ip> <pin> — pair with a passenger using its PIN
             pilot_pair(&args[2], &args[3]);
         }
+        Some("reset") => {
+            // reset — delete auth state and start as passenger (re-enables TOFU)
+            let config = logger::config_dir();
+            let paired = config.join("paired.json");
+            if paired.exists() {
+                std::fs::remove_file(&paired).ok();
+                println!("Removed {}", paired.display());
+            }
+            let token = config.join("pilot-token");
+            if token.exists() {
+                std::fs::remove_file(&token).ok();
+                println!("Removed {}", token.display());
+            }
+            println!("Auth state cleared. Starting as passenger (TOFU enabled)...");
+            print_local_ips();
+            passenger_listen();
+        }
         _ => {
             // Default: passenger mode (double-click friendly)
             print_local_ips();
@@ -730,15 +747,15 @@ fn pilot_connect_with_auth(ip: &str, do_auth: bool) -> (BufReader<TcpStream>, Bu
                     eprintln!("Auth failed: {}. Run 'pair <ip> <pin>' first.", msg);
                     std::process::exit(1);
                 }
-                // auth_ok or legacy error response — proceed
+                // auth_ok — proceed
             }
             Err(_) => {
-                // Connection dropped — maybe old passenger crashed on auth
                 eprintln!("Connection lost during auth. Passenger may need restarting.");
                 std::process::exit(1);
             }
         }
     }
+    // No token — proceed without auth (works if passenger is in TOFU mode)
 
     (reader, writer)
 }
@@ -786,6 +803,12 @@ fn pilot_exec(ip: &str, cmd: &str) {
     }
     match protocol::read_message(&mut reader) {
         Ok(resp) => {
+            let resp_type = json_str_field(&resp, "type").unwrap_or_default();
+            if resp_type == "auth_required" || resp_type == "auth_failed" {
+                let msg = json_str_field(&resp, "message").unwrap_or_default();
+                eprintln!("Auth required: {}. Run 'pair <ip> <pin>' first.", msg);
+                std::process::exit(1);
+            }
             let stdout = json_str_field(&resp, "stdout").unwrap_or_default();
             let stderr = json_str_field(&resp, "stderr").unwrap_or_default();
             let code = json_str_field(&resp, "exit_code").unwrap_or_default();
