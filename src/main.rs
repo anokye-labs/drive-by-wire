@@ -109,7 +109,7 @@ fn passenger_listen() {
 
     let mut tui_state = tui::Tui::new(&pin);
     let tui_tx = tui_state.sender();
-    tui::enable_ansi();
+    tui::enable_ansi(); // no-op now, terminal init in Tui::new()
 
     let addr = format!("0.0.0.0:{}", PORT);
     let listener = match TcpListener::bind(&addr) {
@@ -158,12 +158,14 @@ fn passenger_listen() {
         }
         tui_state.render();
 
-        // Check for keyboard input (Y/N for confirms)
-        if let Some(key) = tui::read_key_nonblocking() {
+        // Check for keyboard input
+        if let Some(key) = tui::poll_key() {
+            if key == '\x03' { break; } // Ctrl+C
+            if (key == 'q' || key == 'Q') && !tui_state.has_pending() { break; }
             tui_state.handle_key(key);
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

@@ -1,38 +1,43 @@
 use std::sync::mpsc;
-use std::io::Write;
+use std::io::{self, Stdout};
 
-const MAX_LOG_LINES: usize = 100;
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
+    Terminal,
+};
+
+const MAX_LOG_LINES: usize = 200;
 
 /// Events sent from the connection handler to the TUI.
 pub enum TuiEvent {
-    /// Connection status changed
-    Connected(String),    // peer address
+    Connected(String),
     Disconnected,
-    /// Auth event
-    AuthAttempt(String),  // peer
-    AuthSuccess(String),  // peer
-    AuthFailed(String),   // peer
-    /// Command received
+    AuthAttempt(String),
+    AuthSuccess(String),
+    AuthFailed(String),
     Command { #[allow(dead_code)] peer: String, cmd_type: String, detail: String, tier: String },
-    /// Command requires confirmation — includes response channel
     ConfirmRequest { id: usize, peer: String, description: String, responder: mpsc::Sender<bool> },
-    /// Command result
     CommandResult { cmd_type: String, success: bool },
-    /// General log message
     #[allow(dead_code)]
     Log(String),
 }
 
-/// The TUI state and renderer.
 pub struct Tui {
     pub rx: mpsc::Receiver<TuiEvent>,
     pub tx: mpsc::Sender<TuiEvent>,
+    terminal: Terminal<CrosstermBackend<Stdout>>,
     pin: String,
     hostname: String,
     connected_peer: Option<String>,
-    log_lines: Vec<String>,
+    log_lines: Vec<LogEntry>,
     pending_confirm: Option<PendingConfirm>,
     stats: Stats,
+    cleaned_up: bool,
 }
 
 struct PendingConfirm {
@@ -43,6 +48,7 @@ struct PendingConfirm {
     responder: mpsc::Sender<bool>,
 }
 
+#[derive(Clone, Copy)]
 struct Stats {
     total_commands: u64,
     auto_approved: u64,
@@ -50,21 +56,53 @@ struct Stats {
     denied: u64,
 }
 
+#[derive(Clone)]
+struct LogEntry {
+    text: String,
+    level: LogLevel,
+}
+
+#[derive(Clone, Copy)]
+enum LogLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+    Command,
+}
+
 impl Tui {
     pub fn new(pin: &str) -> Self {
+        // Set up panic hook to restore terminal on crash
+        let original_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            crossterm::terminal::disable_raw_mode().ok();
+            crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen).ok();
+            original_hook(info);
+        }));
+
+        crossterm::terminal::enable_raw_mode().expect("enable raw mode");
+        let mut stdout = io::stdout();
+        crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)
+            .expect("enter alternate screen");
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend).expect("create terminal");
+
         let (tx, rx) = mpsc::channel();
-        let hostname = std::process::Command::new("hostname").output()
+        let hostname = std::process::Command::new("hostname")
+            .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|_| "unknown".into());
 
         Tui {
-            rx, tx,
+            rx, tx, terminal,
             pin: pin.to_string(),
             hostname,
             connected_peer: None,
             log_lines: Vec::new(),
             pending_confirm: None,
             stats: Stats { total_commands: 0, auto_approved: 0, confirmed: 0, denied: 0 },
+            cleaned_up: false,
         }
     }
 
@@ -72,157 +110,240 @@ impl Tui {
         self.tx.clone()
     }
 
-    /// Update the PIN (after a successful pairing, a new one is generated).
     pub fn set_pin(&mut self, pin: &str) {
         self.pin = pin.to_string();
     }
 
-    /// Add a line to the scrolling log (public).
     pub fn add_log_pub(&mut self, line: String) {
-        self.add_log(line);
+        self.add_log(line, LogLevel::Info);
     }
 
-    /// Add a line to the scrolling log.
-    fn add_log(&mut self, line: String) {
-        self.log_lines.push(line);
+    pub fn has_pending(&self) -> bool {
+        self.pending_confirm.is_some()
+    }
+
+    fn add_log(&mut self, text: String, level: LogLevel) {
+        self.log_lines.push(LogEntry { text, level });
         if self.log_lines.len() > MAX_LOG_LINES {
             self.log_lines.remove(0);
         }
     }
 
-    /// Process all pending events and redraw.
     pub fn process_events(&mut self) {
-        while let Ok(event) = self.rx.try_recv() {
-            match event {
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
                 TuiEvent::Connected(peer) => {
-                    self.add_log(format!("  ● Connected: {}", peer));
+                    self.add_log(format!("Connected: {}", peer), LogLevel::Success);
                     self.connected_peer = Some(peer);
                 }
                 TuiEvent::Disconnected => {
-                    self.add_log("  ○ Disconnected".into());
+                    self.add_log("Disconnected".into(), LogLevel::Warning);
                     self.connected_peer = None;
                 }
                 TuiEvent::AuthAttempt(peer) => {
-                    self.add_log(format!("  🔑 Auth attempt from {}", peer));
+                    self.add_log(format!("Auth attempt from {}", peer), LogLevel::Info);
                 }
                 TuiEvent::AuthSuccess(peer) => {
-                    self.add_log(format!("  ✓ Paired with {}", peer));
+                    self.add_log(format!("Paired with {}", peer), LogLevel::Success);
                 }
                 TuiEvent::AuthFailed(peer) => {
-                    self.add_log(format!("  ✗ Auth failed from {}", peer));
+                    self.add_log(format!("Auth failed from {}", peer), LogLevel::Error);
                 }
                 TuiEvent::Command { peer: _, cmd_type, detail, tier } => {
                     self.stats.total_commands += 1;
-                    let icon = match tier.as_str() {
-                        "auto" => { self.stats.auto_approved += 1; "→" },
-                        "log" => { self.stats.auto_approved += 1; "▸" },
-                        _ => "⚠",
+                    let level = match tier.as_str() {
+                        "auto" | "log" => { self.stats.auto_approved += 1; LogLevel::Command }
+                        _ => LogLevel::Warning,
                     };
                     let display = if detail.len() > 60 {
-                        format!("{}…", &detail[..60])
+                        format!("{}...", &detail[..60])
                     } else {
                         detail
                     };
-                    self.add_log(format!("  {} {} {}", icon, cmd_type, display));
+                    self.add_log(format!("{} {}", cmd_type, display), level);
                 }
                 TuiEvent::ConfirmRequest { id, peer, description, responder } => {
                     self.pending_confirm = Some(PendingConfirm {
                         id, description: description.clone(), peer: peer.clone(), responder,
                     });
-                    self.add_log(format!("  ⚠ CONFIRM? {} (from {})", description, peer));
+                    self.add_log(format!("CONFIRM? {} (from {})", description, peer), LogLevel::Warning);
                 }
                 TuiEvent::CommandResult { cmd_type, success } => {
-                    let icon = if success { "✓" } else { "✗" };
-                    self.add_log(format!("  {} {} completed", icon, cmd_type));
+                    let level = if success { LogLevel::Success } else { LogLevel::Error };
+                    self.add_log(format!("{} completed", cmd_type), level);
                 }
                 TuiEvent::Log(msg) => {
-                    self.add_log(format!("  {}", msg));
+                    self.add_log(msg, LogLevel::Info);
                 }
             }
         }
     }
 
-    /// Render the full TUI to stdout.
-    pub fn render(&self) {
-        let mut out = String::new();
+    pub fn render(&mut self) {
+        let pin = self.pin.clone();
+        let hostname = self.hostname.clone();
+        let connected_peer = self.connected_peer.clone();
+        let stats = self.stats;
+        let log_entries = self.log_lines.clone();
+        let pending = self.pending_confirm.as_ref()
+            .map(|c| (c.description.clone(), c.peer.clone()));
+        let log_dir = crate::logger::log_dir().display().to_string();
 
-        // Clear screen and move cursor to top
-        out.push_str("\x1b[2J\x1b[H");
+        self.terminal.draw(|frame| {
+            let area = frame.area();
+            let confirm_h = if pending.is_some() { 6 } else { 0 };
 
-        // Header
-        out.push_str("\x1b[1;36m╔══════════════════════════════════════════════════════════╗\x1b[0m\n");
-        out.push_str("\x1b[1;36m║\x1b[0m  \x1b[1;37mdrive-by-wire\x1b[0m · passenger                              \x1b[1;36m║\x1b[0m\n");
-        out.push_str("\x1b[1;36m╠══════════════════════════════════════════════════════════╣\x1b[0m\n");
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(5),       // status
+                    Constraint::Min(6),          // activity log
+                    Constraint::Length(confirm_h), // confirm panel
+                    Constraint::Length(1),        // footer
+                ])
+                .split(area);
 
-        // Status line
-        let conn_status = match &self.connected_peer {
-            Some(peer) => format!("\x1b[1;32m● Connected\x1b[0m to {}", peer),
-            None => "\x1b[1;33m○ Waiting for connection\x1b[0m".into(),
-        };
-        out.push_str(&format!("\x1b[1;36m║\x1b[0m  Host: \x1b[1m{:<20}\x1b[0m  {}  \x1b[1;36m\x1b[0m\n", self.hostname, conn_status));
+            // ── Status Panel ──
+            let status_block = Block::default()
+                .title(Line::from(vec![
+                    Span::styled(" drive-by-wire ",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled("· ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("passenger ", Style::default().fg(Color::White)),
+                ]))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan));
 
-        // Pairing PIN
-        out.push_str(&format!("\x1b[1;36m║\x1b[0m  PIN:  \x1b[1;33m{}\x1b[0m                    ", self.pin));
-        out.push_str(&format!("Cmds: {} (auto:{} ok:{} deny:{})\n",
-            self.stats.total_commands, self.stats.auto_approved,
-            self.stats.confirmed, self.stats.denied));
+            let mut line1 = vec![
+                Span::raw("  Host: "),
+                Span::styled(hostname.clone(),
+                    Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("    "),
+            ];
+            match &connected_peer {
+                Some(p) => {
+                    line1.push(Span::styled("● ",
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+                    line1.push(Span::styled(format!("Connected to {}", p),
+                        Style::default().fg(Color::Green)));
+                }
+                None => {
+                    line1.push(Span::styled("○ ",
+                        Style::default().fg(Color::Yellow)));
+                    line1.push(Span::styled("Waiting for connection",
+                        Style::default().fg(Color::Yellow)));
+                }
+            }
 
-        out.push_str("\x1b[1;36m╠══════════════════════════════════════════════════════════╣\x1b[0m\n");
+            let status_text = vec![
+                Line::from(line1),
+                Line::from(vec![
+                    Span::raw("  PIN:  "),
+                    Span::styled(pin.clone(),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw("          "),
+                    Span::styled(
+                        format!("Cmds: {}  Auto: {}  OK: {}  Deny: {}",
+                            stats.total_commands, stats.auto_approved,
+                            stats.confirmed, stats.denied),
+                        Style::default().fg(Color::DarkGray)),
+                ]),
+                Line::default(),
+            ];
+            frame.render_widget(Paragraph::new(status_text).block(status_block), chunks[0]);
 
-        // Confirmation prompt if pending
-        if let Some(ref confirm) = self.pending_confirm {
-            out.push_str(&format!("\x1b[1;31m║ ⚠ APPROVAL REQUIRED\x1b[0m\n"));
-            out.push_str(&format!("\x1b[1;36m║\x1b[0m  From: {}\n", confirm.peer));
-            out.push_str(&format!("\x1b[1;36m║\x1b[0m  Action: \x1b[1m{}\x1b[0m\n", confirm.description));
-            out.push_str(&format!("\x1b[1;36m║\x1b[0m  Press \x1b[1;32m[Y]\x1b[0m to approve, \x1b[1;31m[N]\x1b[0m to deny\n"));
-            out.push_str("\x1b[1;36m╠══════════════════════════════════════════════════════════╣\x1b[0m\n");
-        }
+            // ── Activity Log ──
+            let log_block = Block::default()
+                .title(Span::styled(" Activity ",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan));
 
-        // Activity log header
-        out.push_str("\x1b[1;36m║\x1b[0m  \x1b[1;37mActivity Log\x1b[0m\n");
-        out.push_str("\x1b[1;36m╠══════════════════════════════════════════════════════════╣\x1b[0m\n");
+            let inner_h = log_block.inner(chunks[1]).height as usize;
+            let start = log_entries.len().saturating_sub(inner_h);
 
-        // Show last N log lines (fit terminal)
-        let visible = 15;
-        let start = if self.log_lines.len() > visible { self.log_lines.len() - visible } else { 0 };
-        for line in &self.log_lines[start..] {
-            out.push_str(&format!("\x1b[1;36m║\x1b[0m{}\n", line));
-        }
-        // Pad remaining lines
-        for _ in self.log_lines[start..].len()..visible {
-            out.push_str("\x1b[1;36m║\x1b[0m\n");
-        }
+            let items: Vec<ListItem> = log_entries[start..].iter().map(|entry| {
+                let (icon, color) = match entry.level {
+                    LogLevel::Info    => ("  ", Color::White),
+                    LogLevel::Success => ("✓ ", Color::Green),
+                    LogLevel::Warning => ("⚠ ", Color::Yellow),
+                    LogLevel::Error   => ("✗ ", Color::Red),
+                    LogLevel::Command => ("→ ", Color::Cyan),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(icon, Style::default().fg(color)),
+                    Span::styled(entry.text.clone(), Style::default().fg(color)),
+                ]))
+            }).collect();
 
-        out.push_str("\x1b[1;36m╚══════════════════════════════════════════════════════════╝\x1b[0m\n");
+            frame.render_widget(List::new(items).block(log_block), chunks[1]);
 
-        // Log directory info
-        let log_dir = crate::logger::log_dir();
-        out.push_str(&format!("\x1b[90mLogs: {}\x1b[0m\n", log_dir.display()));
+            // ── Confirmation Panel ──
+            if let Some((desc, peer)) = &pending {
+                let confirm_block = Block::default()
+                    .title(Span::styled(" ⚠ Approval Required ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Red));
 
-        print!("{}", out);
-        let _ = std::io::stdout().flush();
+                let confirm_text = vec![
+                    Line::from(vec![
+                        Span::raw("  From: "),
+                        Span::styled(peer.clone(),
+                            Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw("    Action: "),
+                        Span::styled(desc.clone(),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::default(),
+                    Line::from(vec![
+                        Span::raw("  Press "),
+                        Span::styled("[Y]",
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                        Span::raw(" Approve   "),
+                        Span::styled("[N]",
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                        Span::raw(" Deny"),
+                    ]),
+                ];
+                frame.render_widget(Paragraph::new(confirm_text).block(confirm_block), chunks[2]);
+            }
+
+            // ── Footer ──
+            let footer = Paragraph::new(Line::from(vec![
+                Span::styled(" Logs: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(log_dir.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[Q]", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                Span::styled("uit  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[Ctrl+C]", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                Span::styled(" Exit", Style::default().fg(Color::DarkGray)),
+            ]));
+            frame.render_widget(footer, chunks[3]);
+        }).ok();
     }
 
-    /// Handle a keypress. Returns true if a confirmation was answered.
     pub fn handle_key(&mut self, key: char) -> bool {
         if let Some(confirm) = self.pending_confirm.take() {
             match key {
                 'y' | 'Y' => {
                     self.stats.confirmed += 1;
                     let _ = confirm.responder.send(true);
-                    self.add_log(format!("  \x1b[32m✓ APPROVED\x1b[0m: {}", confirm.description));
+                    self.add_log(format!("APPROVED: {}", confirm.description), LogLevel::Success);
                     crate::logger::log_command(&confirm.peer, "confirm", &confirm.description, "APPROVED");
                     true
                 }
                 'n' | 'N' => {
                     self.stats.denied += 1;
                     let _ = confirm.responder.send(false);
-                    self.add_log(format!("  \x1b[31m✗ DENIED\x1b[0m: {}", confirm.description));
+                    self.add_log(format!("DENIED: {}", confirm.description), LogLevel::Error);
                     crate::logger::log_command(&confirm.peer, "confirm", &confirm.description, "DENIED");
                     true
                 }
                 _ => {
-                    // Put it back
                     self.pending_confirm = Some(confirm);
                     false
                 }
@@ -231,44 +352,41 @@ impl Tui {
             false
         }
     }
-}
 
-/// Enable virtual terminal processing for ANSI escape codes on Windows.
-pub fn enable_ansi() {
-    #[cfg(windows)]
-    {
-        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-        const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5u32;
-        unsafe extern "system" {
-            fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
-            fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
-            fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
-        }
-        unsafe {
-            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-            let mut mode: u32 = 0;
-            GetConsoleMode(handle, &mut mode);
-            SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-        }
+    pub fn cleanup(&mut self) {
+        if self.cleaned_up { return; }
+        self.cleaned_up = true;
+        crossterm::terminal::disable_raw_mode().ok();
+        crossterm::execute!(self.terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen).ok();
+        self.terminal.show_cursor().ok();
     }
 }
 
-/// Read a single keypress without waiting for Enter (Windows).
-pub fn read_key_nonblocking() -> Option<char> {
-    #[cfg(windows)]
-    {
-        unsafe extern "C" {
-            fn _kbhit() -> i32;
-            fn _getch() -> i32;
-        }
-        unsafe {
-            if _kbhit() != 0 {
-                let ch = _getch();
-                if ch > 0 && ch < 128 {
-                    return Some(ch as u8 as char);
+impl Drop for Tui {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+/// Poll for a keypress without blocking.
+pub fn poll_key() -> Option<char> {
+    if event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(key)) = event::read() {
+            return match key.code {
+                KeyCode::Char(c) => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                        Some('\x03')
+                    } else {
+                        Some(c)
+                    }
                 }
-            }
+                KeyCode::Esc => Some('\x1b'),
+                _ => None,
+            };
         }
     }
     None
 }
+
+/// No longer needed — terminal init handled by Tui::new().
+pub fn enable_ansi() {}
