@@ -102,7 +102,7 @@ fn extract_ip(line: &str) -> Option<String> {
 
 /// Find peer IPs from the ARP table for the given adapter.
 /// Filters to 169.254.x.x addresses with real MAC addresses (not 00-00-00 or ff-ff-ff).
-fn find_arp_peers(adapter_name: &str, our_ip: &str) -> Vec<String> {
+fn find_arp_peers(_adapter_name: &str, our_ip: &str) -> Vec<String> {
     let output = match std::process::Command::new("arp").arg("-a").output() {
         Ok(o) => o,
         Err(_) => return Vec::new(),

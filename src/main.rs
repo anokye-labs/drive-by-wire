@@ -2,9 +2,14 @@ mod protocol;
 mod executor;
 mod mcp;
 mod discover;
+mod logger;
+mod auth;
+mod security;
+mod tui;
 
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex, mpsc};
 
 const PORT: u16 = 7842;
 
@@ -55,6 +60,10 @@ fn main() {
                 }
             }
         }
+        Some("pair") if args.len() > 3 => {
+            // pair <ip> <pin> — pair with a passenger using its PIN
+            pilot_pair(&args[2], &args[3]);
+        }
         _ => {
             // Default: passenger mode (double-click friendly)
             print_local_ips();
@@ -92,6 +101,15 @@ fn add_firewall_rule() {
 
 fn passenger_listen() {
     add_firewall_rule();
+    logger::init();
+    logger::log("STARTUP", "Passenger starting");
+
+    let auth = Arc::new(Mutex::new(auth::Auth::init()));
+    let pin = auth.lock().unwrap().pin().to_string();
+
+    let mut tui_state = tui::Tui::new(&pin);
+    let tui_tx = tui_state.sender();
+    tui::enable_ansi();
 
     let addr = format!("0.0.0.0:{}", PORT);
     let listener = match TcpListener::bind(&addr) {
@@ -103,29 +121,144 @@ fn passenger_listen() {
             return;
         }
     };
+    listener.set_nonblocking(true).ok();
+    logger::log("STARTUP", &format!("Listening on port {}", PORT));
+    tui_state.add_log_pub("Listening on port 7842...".into());
+    tui_state.render();
+
+    let confirm_counter = Arc::new(Mutex::new(0usize));
 
     loop {
+        // Check for incoming connections (non-blocking)
         match listener.accept() {
             Ok((stream, peer)) => {
-                println!("Connection from {}", peer);
-                handle_connection(stream);
-                println!("Disconnected. Waiting for next connection...");
+                let peer_str = peer.to_string();
+                logger::log_connection(&peer_str, "incoming");
+                let tx = tui_tx.clone();
+                let auth_clone = Arc::clone(&auth);
+                let counter = Arc::clone(&confirm_counter);
+
+                std::thread::spawn(move || {
+                    handle_connection_secure(stream, &peer_str, tx, auth_clone, counter);
+                });
             }
-            Err(e) => eprintln!("Accept error: {}", e),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No connection pending — normal
+            }
+            Err(e) => {
+                logger::log("ERROR", &format!("Accept error: {}", e));
+            }
         }
+
+        // Process TUI events and redraw
+        tui_state.process_events();
+        // Update PIN in case it changed after pairing
+        if let Ok(a) = auth.lock() {
+            tui_state.set_pin(a.pin());
+        }
+        tui_state.render();
+
+        // Check for keyboard input (Y/N for confirms)
+        if let Some(key) = tui::read_key_nonblocking() {
+            tui_state.handle_key(key);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-fn handle_connection(stream: TcpStream) {
+fn handle_connection_secure(
+    stream: TcpStream,
+    peer: &str,
+    tx: mpsc::Sender<tui::TuiEvent>,
+    auth: Arc<Mutex<auth::Auth>>,
+    counter: Arc<Mutex<usize>>,
+) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut writer = BufWriter::new(stream);
 
+    tx.send(tui::TuiEvent::Connected(peer.to_string())).ok();
+
+    // Auth handshake: first message must be "auth"
+    let first_msg = match protocol::read_message(&mut reader) {
+        Ok(m) => m,
+        Err(_) => {
+            tx.send(tui::TuiEvent::Disconnected).ok();
+            return;
+        }
+    };
+
+    let msg_type = json_str_field(&first_msg, "type").unwrap_or_default();
+    let authenticated = match msg_type.as_str() {
+        "auth" => {
+            let token = json_str_field(&first_msg, "token");
+            let pin = json_str_field(&first_msg, "pin");
+
+            tx.send(tui::TuiEvent::AuthAttempt(peer.to_string())).ok();
+            logger::log_auth(peer, "auth attempt");
+
+            if let Some(tok) = token {
+                // Token-based auth (previously paired)
+                let ok = auth.lock().unwrap().is_paired(&tok);
+                if ok {
+                    let resp = r#"{"type":"auth_ok"}"#;
+                    protocol::write_message(&mut writer, resp).ok();
+                    tx.send(tui::TuiEvent::AuthSuccess(peer.to_string())).ok();
+                    logger::log_auth(peer, "token accepted");
+                    true
+                } else {
+                    let resp = r#"{"type":"auth_failed","message":"invalid token"}"#;
+                    protocol::write_message(&mut writer, resp).ok();
+                    tx.send(tui::TuiEvent::AuthFailed(peer.to_string())).ok();
+                    logger::log_auth(peer, "invalid token");
+                    false
+                }
+            } else if let Some(p) = pin {
+                // PIN-based pairing
+                let result = auth.lock().unwrap().try_pair(&p);
+                if let Some(new_token) = result {
+                    let resp = format!(r#"{{"type":"auth_ok","token":"{}"}}"#, new_token);
+                    protocol::write_message(&mut writer, &resp).ok();
+                    tx.send(tui::TuiEvent::AuthSuccess(peer.to_string())).ok();
+                    logger::log_auth(peer, "PIN accepted, paired");
+                    true
+                } else {
+                    let resp = r#"{"type":"auth_failed","message":"wrong PIN"}"#;
+                    protocol::write_message(&mut writer, resp).ok();
+                    tx.send(tui::TuiEvent::AuthFailed(peer.to_string())).ok();
+                    logger::log_auth(peer, "wrong PIN");
+                    false
+                }
+            } else {
+                let resp = r#"{"type":"auth_failed","message":"provide token or pin"}"#;
+                protocol::write_message(&mut writer, resp).ok();
+                tx.send(tui::TuiEvent::AuthFailed(peer.to_string())).ok();
+                false
+            }
+        }
+        _ => {
+            // No auth message — reject
+            let resp = r#"{"type":"auth_required","message":"send auth first"}"#;
+            protocol::write_message(&mut writer, resp).ok();
+            tx.send(tui::TuiEvent::AuthFailed(peer.to_string())).ok();
+            logger::log_auth(peer, "no auth message");
+            false
+        }
+    };
+
+    if !authenticated {
+        tx.send(tui::TuiEvent::Disconnected).ok();
+        logger::log_connection(peer, "rejected (auth failed)");
+        return;
+    }
+
+    // Authenticated — process commands with ACL
     loop {
         let msg = match protocol::read_message(&mut reader) {
             Ok(m) => m,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                    eprintln!("Read error: {}", e);
+                    logger::log("ERROR", &format!("Read error from {}: {}", peer, e));
                 }
                 break;
             }
@@ -133,245 +266,297 @@ fn handle_connection(stream: TcpStream) {
 
         let msg_type = json_str_field(&msg, "type").unwrap_or_default();
         let id = json_str_field(&msg, "id").unwrap_or_default();
+        let tier = security::classify(&msg_type);
 
-        let response = match msg_type.as_str() {
-            "ping" => {
-                format!(r#"{{"type":"pong","id":"{}"}}"#, id)
-            }
-            "exec" => {
-                let cmd = json_str_field(&msg, "cmd").unwrap_or_default();
-                let working_dir = json_str_field(&msg, "working_dir");
-                println!("  exec: {}", cmd);
-                let (code, stdout, stderr) = executor::exec(&cmd, working_dir.as_deref());
-                format!(
-                    r#"{{"type":"exec_result","id":"{}","exit_code":{},"stdout":{},"stderr":{}}}"#,
-                    id, code, json_escape(&stdout), json_escape(&stderr)
-                )
-            }
-            "push" => {
-                let dest = json_str_field(&msg, "dest_path").unwrap_or_default();
-                let size = json_u64_field(&msg, "size").unwrap_or(0) as usize;
-                println!("  push: {} ({} bytes)", dest, size);
-                match handle_push(&mut reader, &dest, size) {
-                    Ok(()) => format!(r#"{{"type":"ack","id":"{}"}}"#, id),
-                    Err(e) => format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(&e.to_string())),
-                }
-            }
-            "pull" => {
-                let src = json_str_field(&msg, "src_path").unwrap_or_default();
-                println!("  pull: {}", src);
-                match std::fs::read(&src) {
-                    Ok(data) => {
-                        let header = format!(r#"{{"type":"file_data","id":"{}","size":{}}}"#, id, data.len());
-                        if let Err(e) = protocol::write_message(&mut writer, &header) {
-                            eprintln!("Write error: {}", e);
-                            break;
-                        }
-                        if let Err(e) = protocol::write_raw_bytes(&mut writer, &data) {
-                            eprintln!("Write error: {}", e);
-                            break;
-                        }
-                        continue; // already sent response
-                    }
-                    Err(e) => format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(&e.to_string())),
-                }
-            }
-            "ls" => {
-                let path = json_str_field(&msg, "path").unwrap_or_else(|| ".".into());
-                println!("  ls: {}", path);
-                handle_ls(&id, &path)
-            }
-            "sysinfo" => {
-                println!("  sysinfo");
-                handle_sysinfo(&id)
-            }
-            "reg_read" => {
-                let path = json_str_field(&msg, "path").unwrap_or_default();
-                let name = json_str_field(&msg, "name").unwrap_or_default();
-                println!("  reg_read: {}\\{}", path, name);
-                let cmd = format!("(Get-ItemProperty '{}' -Name '{}' -ErrorAction Stop).'{}'", path, name, name);
-                let (code, stdout, stderr) = executor::exec(&cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"reg_result","id":"{}","value":{}}}"#, id, json_escape(stdout.trim()))
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "reg_write" => {
-                let path = json_str_field(&msg, "path").unwrap_or_default();
-                let name = json_str_field(&msg, "name").unwrap_or_default();
-                let value = json_str_field(&msg, "value").unwrap_or_default();
-                let kind = json_str_field(&msg, "kind").unwrap_or_else(|| "String".into());
-                println!("  reg_write: {}\\{} = {}", path, name, value);
-                let ps_type = match kind.as_str() {
-                    "REG_DWORD" | "DWord" => "DWord",
-                    "REG_QWORD" | "QWord" => "QWord",
-                    "REG_EXPAND_SZ" | "ExpandString" => "ExpandString",
-                    "REG_MULTI_SZ" | "MultiString" => "MultiString",
-                    _ => "String",
-                };
-                let cmd = format!(
-                    "New-ItemProperty -Path '{}' -Name '{}' -Value '{}' -PropertyType {} -Force | Out-Null",
-                    path, name, value, ps_type
-                );
-                let (code, _, stderr) = executor::exec(&cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "reg_delete" => {
-                let path = json_str_field(&msg, "path").unwrap_or_default();
-                let name = json_str_field(&msg, "name").unwrap_or_default();
-                println!("  reg_delete: {}\\{}", path, name);
-                let cmd = format!("Remove-ItemProperty -Path '{}' -Name '{}' -Force -ErrorAction Stop", path, name);
-                let (code, _, stderr) = executor::exec(&cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "service" => {
-                let name = json_str_field(&msg, "name").unwrap_or_default();
-                let action = json_str_field(&msg, "action").unwrap_or_default();
-                println!("  service: {} {}", action, name);
-                let cmd = match action.as_str() {
-                    "start" => format!("Start-Service '{}' -ErrorAction Stop; Get-Service '{}'", name, name),
-                    "stop" => format!("Stop-Service '{}' -Force -ErrorAction Stop; Get-Service '{}'", name, name),
-                    "restart" => format!("Restart-Service '{}' -Force -ErrorAction Stop; Get-Service '{}'", name, name),
-                    "status" => format!("Get-Service '{}'", name),
-                    _ => format!("echo 'unknown action: {}'", action),
-                };
-                let (code, stdout, stderr) = executor::exec(&cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"exec_result","id":"{}","exit_code":0,"stdout":{},"stderr":""}}"#, id, json_escape(stdout.trim()))
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "env_set" => {
-                let name = json_str_field(&msg, "name").unwrap_or_default();
-                let value = json_str_field(&msg, "value").unwrap_or_default();
-                let scope = json_str_field(&msg, "scope").unwrap_or_else(|| "machine".into());
-                println!("  env_set: {} = {} ({})", name, value, scope);
-                let target = if scope == "user" { "User" } else { "Machine" };
-                let cmd = format!("[Environment]::SetEnvironmentVariable('{}', '{}', '{}')", name, value, target);
-                let (code, _, stderr) = executor::exec(&cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "reboot" => {
-                let delay = json_u64_field(&msg, "delay_secs").unwrap_or(5);
-                println!("  reboot in {} seconds", delay);
-                let cmd = format!("shutdown /r /t {}", delay);
-                let (_, _, _) = executor::exec(&cmd, None);
-                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
-            }
-            "enable_rdp" => {
-                println!("  enable_rdp");
-                let cmd = concat!(
-                    "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force; ",
-                    "Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue; ",
-                    "Write-Output 'RDP enabled'"
-                );
-                let (code, stdout, stderr) = executor::exec(cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "enable_ssh" => {
-                println!("  enable_ssh");
-                let cmd = concat!(
-                    "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue; ",
-                    "Start-Service sshd -ErrorAction SilentlyContinue; ",
-                    "Set-Service -Name sshd -StartupType Automatic; ",
-                    "New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue; ",
-                    "Write-Output 'SSH enabled'"
-                );
-                let (code, stdout, stderr) = executor::exec(cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "set_hostname" => {
-                let name = json_str_field(&msg, "name").unwrap_or_default();
-                println!("  set_hostname: {}", name);
-                let cmd = format!("Rename-Computer -NewName '{}' -Force", name);
-                let (code, _, stderr) = executor::exec(&cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"ack","id":"{}","message":"Reboot required for hostname change"}}"#, id)
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "set_power" => {
-                let plan = json_str_field(&msg, "plan").unwrap_or_default();
-                println!("  set_power: {}", plan);
-                let guid = match plan.as_str() {
-                    "high_performance" => "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
-                    _ => "381b4222-f694-41f0-9685-ff5bb260df2e", // balanced
-                };
-                let cmd = format!("powercfg /setactive {}", guid);
-                let (code, _, stderr) = executor::exec(&cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "create_user" => {
-                let username = json_str_field(&msg, "username").unwrap_or_default();
-                let password = json_str_field(&msg, "password").unwrap_or_default();
-                let admin = msg.contains("\"admin\":true");
-                println!("  create_user: {} (admin={})", username, admin);
-                let mut cmd = format!(
-                    "net user '{}' '{}' /add", username, password
-                );
-                if admin {
-                    cmd.push_str(&format!("; net localgroup Administrators '{}' /add", username));
-                }
-                let (code, stdout, stderr) = executor::exec(&cmd, None);
-                if code == 0 {
-                    format!(r#"{{"type":"ack","id":"{}"}}"#, id)
-                } else {
-                    format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
-                }
-            }
-            "winget_install" => {
-                let package = json_str_field(&msg, "package_id").unwrap_or_default();
-                println!("  winget_install: {}", package);
-                let cmd = format!("winget install '{}' --silent --accept-package-agreements --accept-source-agreements", package);
-                let (code, stdout, stderr) = executor::exec(&cmd, None);
-                format!(
-                    r#"{{"type":"exec_result","id":"{}","exit_code":{},"stdout":{},"stderr":{}}}"#,
-                    id, code, json_escape(stdout.trim()), json_escape(stderr.trim())
-                )
-            }
-            "winget_list" => {
-                println!("  winget_list");
-                let (code, stdout, stderr) = executor::exec("winget list", None);
-                format!(
-                    r#"{{"type":"exec_result","id":"{}","exit_code":{},"stdout":{},"stderr":{}}}"#,
-                    id, code, json_escape(stdout.trim()), json_escape(stderr.trim())
-                )
-            }
-            _ => {
-                format!(r#"{{"type":"error","id":"{}","message":"unknown message type: {}"}}"#, id, msg_type)
-            }
+        // Log the command
+        let detail = truncate_for_display(&msg, 120);
+        let tier_str = match tier {
+            security::Tier::Auto => "auto",
+            security::Tier::Log => "log",
+            security::Tier::Confirm => "confirm",
         };
+        tx.send(tui::TuiEvent::Command {
+            peer: peer.to_string(),
+            cmd_type: msg_type.clone(),
+            detail: detail.clone(),
+            tier: tier_str.to_string(),
+        }).ok();
+        logger::log_command(peer, &msg_type, &detail, tier_str);
+
+        // Check authorization
+        if tier == security::Tier::Confirm {
+            let description = security::describe_command(&msg_type, &msg);
+            let (resp_tx, resp_rx) = mpsc::channel();
+            let confirm_id = {
+                let mut c = counter.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            tx.send(tui::TuiEvent::ConfirmRequest {
+                id: confirm_id,
+                peer: peer.to_string(),
+                description: description.clone(),
+                responder: resp_tx,
+            }).ok();
+
+            // Wait for confirmation (blocks this connection's thread)
+            match resp_rx.recv_timeout(std::time::Duration::from_secs(120)) {
+                Ok(true) => { /* approved, continue */ }
+                Ok(false) => {
+                    let resp = format!(
+                        r#"{{"type":"error","id":"{}","message":"denied by operator"}}"#, id
+                    );
+                    protocol::write_message(&mut writer, &resp).ok();
+                    continue;
+                }
+                Err(_) => {
+                    let resp = format!(
+                        r#"{{"type":"error","id":"{}","message":"confirmation timed out (120s)"}}"#, id
+                    );
+                    protocol::write_message(&mut writer, &resp).ok();
+                    continue;
+                }
+            }
+        }
+
+        // Dispatch the command
+        // Pull needs special handling (writes directly to stream)
+        if msg_type == "pull" {
+            let src = json_str_field(&msg, "src_path").unwrap_or_default();
+            match std::fs::read(&src) {
+                Ok(data) => {
+                    let header = format!(r#"{{"type":"file_data","id":"{}","size":{}}}"#, id, data.len());
+                    if protocol::write_message(&mut writer, &header).is_err() { break; }
+                    if protocol::write_raw_bytes(&mut writer, &data).is_err() { break; }
+                    tx.send(tui::TuiEvent::CommandResult { cmd_type: "pull".into(), success: true }).ok();
+                }
+                Err(e) => {
+                    let resp = format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(&e.to_string()));
+                    if protocol::write_message(&mut writer, &resp).is_err() { break; }
+                    tx.send(tui::TuiEvent::CommandResult { cmd_type: "pull".into(), success: false }).ok();
+                }
+            }
+            continue;
+        }
+
+        let response = dispatch_command(&msg_type, &id, &msg, &mut reader);
+
+        let success = !response.contains("\"type\":\"error\"");
+        tx.send(tui::TuiEvent::CommandResult {
+            cmd_type: msg_type.clone(),
+            success,
+        }).ok();
 
         if let Err(e) = protocol::write_message(&mut writer, &response) {
-            eprintln!("Write error: {}", e);
+            logger::log("ERROR", &format!("Write error to {}: {}", peer, e));
             break;
+        }
+    }
+
+    tx.send(tui::TuiEvent::Disconnected).ok();
+    logger::log_connection(peer, "disconnected");
+}
+
+fn truncate_for_display(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+}
+
+/// Dispatch a command and return the response JSON.
+/// Extracted from handle_connection so both secure and legacy paths can use it.
+fn dispatch_command(
+    msg_type: &str, id: &str, msg: &str,
+    reader: &mut BufReader<TcpStream>,
+) -> String {
+    match msg_type {
+        "ping" => format!(r#"{{"type":"pong","id":"{}"}}"#, id),
+        "exec" => {
+            let cmd = json_str_field(msg, "cmd").unwrap_or_default();
+            let working_dir = json_str_field(msg, "working_dir");
+            let (code, stdout, stderr) = executor::exec(&cmd, working_dir.as_deref());
+            format!(
+                r#"{{"type":"exec_result","id":"{}","exit_code":{},"stdout":{},"stderr":{}}}"#,
+                id, code, json_escape(&stdout), json_escape(&stderr)
+            )
+        }
+        "push" => {
+            let dest = json_str_field(msg, "dest_path").unwrap_or_default();
+            let size = json_u64_field(msg, "size").unwrap_or(0) as usize;
+            match handle_push(reader, &dest, size) {
+                Ok(()) => format!(r#"{{"type":"ack","id":"{}"}}"#, id),
+                Err(e) => format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(&e.to_string())),
+            }
+        }
+        "ls" => {
+            let path = json_str_field(msg, "path").unwrap_or_else(|| ".".into());
+            handle_ls(id, &path)
+        }
+        "sysinfo" => handle_sysinfo(id),
+        "reg_read" => {
+            let path = json_str_field(msg, "path").unwrap_or_default();
+            let name = json_str_field(msg, "name").unwrap_or_default();
+            let cmd = format!("(Get-ItemProperty '{}' -Name '{}' -ErrorAction Stop).'{}'", path, name, name);
+            let (code, stdout, stderr) = executor::exec(&cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"reg_result","id":"{}","value":{}}}"#, id, json_escape(stdout.trim()))
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "reg_write" => {
+            let path = json_str_field(msg, "path").unwrap_or_default();
+            let name = json_str_field(msg, "name").unwrap_or_default();
+            let value = json_str_field(msg, "value").unwrap_or_default();
+            let kind = json_str_field(msg, "kind").unwrap_or_else(|| "String".into());
+            let ps_type = match kind.as_str() {
+                "REG_DWORD" | "DWord" => "DWord",
+                "REG_QWORD" | "QWord" => "QWord",
+                "REG_EXPAND_SZ" | "ExpandString" => "ExpandString",
+                "REG_MULTI_SZ" | "MultiString" => "MultiString",
+                _ => "String",
+            };
+            let cmd = format!(
+                "New-ItemProperty -Path '{}' -Name '{}' -Value '{}' -PropertyType {} -Force | Out-Null",
+                path, name, value, ps_type
+            );
+            let (code, _, stderr) = executor::exec(&cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "reg_delete" => {
+            let path = json_str_field(msg, "path").unwrap_or_default();
+            let name = json_str_field(msg, "name").unwrap_or_default();
+            let cmd = format!("Remove-ItemProperty -Path '{}' -Name '{}' -Force -ErrorAction Stop", path, name);
+            let (code, _, stderr) = executor::exec(&cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "service" => {
+            let svc_name = json_str_field(msg, "name").unwrap_or_default();
+            let action = json_str_field(msg, "action").unwrap_or_default();
+            let cmd = match action.as_str() {
+                "start" => format!("Start-Service '{}' -ErrorAction Stop; Get-Service '{}'", svc_name, svc_name),
+                "stop" => format!("Stop-Service '{}' -Force -ErrorAction Stop; Get-Service '{}'", svc_name, svc_name),
+                "restart" => format!("Restart-Service '{}' -Force -ErrorAction Stop; Get-Service '{}'", svc_name, svc_name),
+                "status" => format!("Get-Service '{}'", svc_name),
+                _ => format!("echo 'unknown action: {}'", action),
+            };
+            let (code, stdout, stderr) = executor::exec(&cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"exec_result","id":"{}","exit_code":0,"stdout":{},"stderr":""}}"#, id, json_escape(stdout.trim()))
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "env_set" => {
+            let name = json_str_field(msg, "name").unwrap_or_default();
+            let value = json_str_field(msg, "value").unwrap_or_default();
+            let scope = json_str_field(msg, "scope").unwrap_or_else(|| "machine".into());
+            let target = if scope == "user" { "User" } else { "Machine" };
+            let cmd = format!("[Environment]::SetEnvironmentVariable('{}', '{}', '{}')", name, value, target);
+            let (code, _, stderr) = executor::exec(&cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "reboot" => {
+            let delay = json_u64_field(msg, "delay_secs").unwrap_or(5);
+            let cmd = format!("shutdown /r /t {}", delay);
+            let (_, _, _) = executor::exec(&cmd, None);
+            format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+        }
+        "enable_rdp" => {
+            let cmd = concat!(
+                "Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force; ",
+                "Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue; ",
+                "Write-Output 'RDP enabled'"
+            );
+            let (code, _, stderr) = executor::exec(cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "enable_ssh" => {
+            let cmd = concat!(
+                "Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue; ",
+                "Start-Service sshd -ErrorAction SilentlyContinue; ",
+                "Set-Service -Name sshd -StartupType Automatic; ",
+                "New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue; ",
+                "Write-Output 'SSH enabled'"
+            );
+            let (code, _, stderr) = executor::exec(cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "set_hostname" => {
+            let name = json_str_field(msg, "name").unwrap_or_default();
+            let cmd = format!("Rename-Computer -NewName '{}' -Force", name);
+            let (code, _, stderr) = executor::exec(&cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"ack","id":"{}","message":"Reboot required for hostname change"}}"#, id)
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "set_power" => {
+            let plan = json_str_field(msg, "plan").unwrap_or_default();
+            let guid = match plan.as_str() {
+                "high_performance" => "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+                _ => "381b4222-f694-41f0-9685-ff5bb260df2e",
+            };
+            let cmd = format!("powercfg /setactive {}", guid);
+            let (code, _, stderr) = executor::exec(&cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "create_user" => {
+            let username = json_str_field(msg, "username").unwrap_or_default();
+            let password = json_str_field(msg, "password").unwrap_or_default();
+            let admin = msg.contains("\"admin\":true");
+            let mut cmd = format!("net user '{}' '{}' /add", username, password);
+            if admin {
+                cmd.push_str(&format!("; net localgroup Administrators '{}' /add", username));
+            }
+            let (code, _, stderr) = executor::exec(&cmd, None);
+            if code == 0 {
+                format!(r#"{{"type":"ack","id":"{}"}}"#, id)
+            } else {
+                format!(r#"{{"type":"error","id":"{}","message":{}}}"#, id, json_escape(stderr.trim()))
+            }
+        }
+        "winget_install" => {
+            let package = json_str_field(msg, "package_id").unwrap_or_default();
+            let cmd = format!("winget install '{}' --silent --accept-package-agreements --accept-source-agreements", package);
+            let (code, stdout, stderr) = executor::exec(&cmd, None);
+            format!(
+                r#"{{"type":"exec_result","id":"{}","exit_code":{},"stdout":{},"stderr":{}}}"#,
+                id, code, json_escape(stdout.trim()), json_escape(stderr.trim())
+            )
+        }
+        "winget_list" => {
+            let (code, stdout, stderr) = executor::exec("winget list", None);
+            format!(
+                r#"{{"type":"exec_result","id":"{}","exit_code":{},"stdout":{},"stderr":{}}}"#,
+                id, code, json_escape(stdout.trim()), json_escape(stderr.trim())
+            )
+        }
+        _ => {
+            format!(r#"{{"type":"error","id":"{}","message":"unknown message type: {}"}}"#, id, msg_type)
         }
     }
 }
@@ -468,12 +653,85 @@ fn json_escape(s: &str) -> String {
 
 // --- Pilot-side commands ---
 
+fn pilot_token_path() -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Public".into());
+    std::path::PathBuf::from(home).join(".drive-by-wire").join("pilot-token")
+}
+
+fn load_pilot_token() -> Option<String> {
+    std::fs::read_to_string(pilot_token_path()).ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_pilot_token(token: &str) {
+    let path = pilot_token_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, token).ok();
+}
+
 fn pilot_connect(ip: &str) -> (BufReader<TcpStream>, BufWriter<TcpStream>) {
+    pilot_connect_with_auth(ip, true)
+}
+
+fn pilot_connect_with_auth(ip: &str, do_auth: bool) -> (BufReader<TcpStream>, BufWriter<TcpStream>) {
     let addr = format!("{}:{}", ip, PORT);
     let stream = TcpStream::connect(&addr).expect("connect failed");
-    let reader = BufReader::new(stream.try_clone().unwrap());
-    let writer = BufWriter::new(stream);
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = BufWriter::new(stream);
+
+    if !do_auth { return (reader, writer); }
+
+    // Authenticate if we have a token
+    if let Some(token) = load_pilot_token() {
+        let auth_msg = format!(r#"{{"type":"auth","token":"{}"}}"#, token);
+        protocol::write_message(&mut writer, &auth_msg).unwrap();
+        match protocol::read_message(&mut reader) {
+            Ok(resp) => {
+                let resp_type = json_str_field(&resp, "type").unwrap_or_default();
+                if resp_type == "auth_failed" || resp_type == "auth_required" {
+                    let msg = json_str_field(&resp, "message").unwrap_or_default();
+                    eprintln!("Auth failed: {}. Run 'pair <ip> <pin>' first.", msg);
+                    std::process::exit(1);
+                }
+                // auth_ok or legacy error response — proceed
+            }
+            Err(_) => {
+                // Connection dropped — maybe old passenger crashed on auth
+                eprintln!("Connection lost during auth. Passenger may need restarting.");
+                std::process::exit(1);
+            }
+        }
+    }
+
     (reader, writer)
+}
+
+fn pilot_pair(ip: &str, pin: &str) {
+    let addr = format!("{}:{}", ip, PORT);
+    let stream = TcpStream::connect(&addr).expect("connect failed");
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = BufWriter::new(stream);
+
+    let auth_msg = format!(r#"{{"type":"auth","pin":"{}"}}"#, pin);
+    protocol::write_message(&mut writer, &auth_msg).unwrap();
+    let resp = protocol::read_message(&mut reader).unwrap();
+
+    let resp_type = json_str_field(&resp, "type").unwrap_or_default();
+    if resp_type == "auth_ok" {
+        if let Some(token) = json_str_field(&resp, "token") {
+            save_pilot_token(&token);
+            println!("Paired successfully! Token saved.");
+        } else {
+            println!("Paired (no token received — legacy passenger?)");
+        }
+    } else {
+        let msg = json_str_field(&resp, "message").unwrap_or_default();
+        eprintln!("Pairing failed: {}", msg);
+        std::process::exit(1);
+    }
 }
 
 fn pilot_echo(ip: &str) {

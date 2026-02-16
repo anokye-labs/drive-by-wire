@@ -441,9 +441,60 @@ fn connect_peer(ip: &str) -> io::Result<(BufReader<TcpStream>, BufWriter<TcpStre
         &addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         std::time::Duration::from_secs(5),
     )?;
-    let reader = BufReader::new(stream.try_clone()?);
-    let writer = BufWriter::new(stream);
-    Ok((reader, writer))
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = BufWriter::new(stream);
+
+    // Authenticate
+    let token = load_pilot_token();
+    let auth_msg = if let Some(ref tok) = token {
+        format!(r#"{{"type":"auth","token":"{}"}}"#, tok)
+    } else {
+        // No token — try without auth (for legacy passengers)
+        return Ok((reader, writer));
+    };
+
+    crate::protocol::write_message(&mut writer, &auth_msg)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("auth write: {}", e)))?;
+
+    let resp = crate::protocol::read_message(&mut reader)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("auth read: {}", e)))?;
+
+    let resp_type = crate::json_str_field(&resp, "type").unwrap_or_default();
+    match resp_type.as_str() {
+        "auth_ok" => {
+            // Check if passenger sent us a new token (from PIN pairing)
+            if let Some(new_tok) = crate::json_str_field(&resp, "token") {
+                save_pilot_token(&new_tok);
+            }
+            Ok((reader, writer))
+        }
+        "auth_required" | "auth_failed" => {
+            let msg = crate::json_str_field(&resp, "message").unwrap_or_else(|| "auth failed".into());
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, msg))
+        }
+        _ => {
+            // Legacy passenger that doesn't understand auth — treat response as data
+            // Put the response back... actually we can't. For legacy compat, just proceed.
+            Ok((reader, writer))
+        }
+    }
+}
+
+fn pilot_token_path() -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Public".into());
+    std::path::PathBuf::from(home).join(".drive-by-wire").join("pilot-token")
+}
+
+fn load_pilot_token() -> Option<String> {
+    std::fs::read_to_string(pilot_token_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn save_pilot_token(token: &str) {
+    let path = pilot_token_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, token).ok();
 }
 
 // JSON-RPC helpers
