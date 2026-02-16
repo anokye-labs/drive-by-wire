@@ -174,6 +174,7 @@ fn handle_connection_secure(
     auth: Arc<Mutex<auth::Auth>>,
     counter: Arc<Mutex<usize>>,
 ) {
+    stream.set_nonblocking(false).ok();
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut writer = BufWriter::new(stream);
 
@@ -777,16 +778,24 @@ fn pilot_exec(ip: &str, cmd: &str) {
     let (mut reader, mut writer) = pilot_connect(ip);
 
     let msg = format!(r#"{{"type":"exec","id":"1","cmd":"{}"}}"#, cmd.replace('\\', "\\\\").replace('"', "\\\""));
-    protocol::write_message(&mut writer, &msg).unwrap();
-    let resp = protocol::read_message(&mut reader).unwrap();
-    
-    let stdout = json_str_field(&resp, "stdout").unwrap_or_default();
-    let stderr = json_str_field(&resp, "stderr").unwrap_or_default();
-    let code = json_str_field(&resp, "exit_code").unwrap_or_default();
-    
-    if !stdout.is_empty() { print!("{}", stdout); }
-    if !stderr.is_empty() { eprint!("{}", stderr); }
-    if code != "0" && !code.is_empty() { eprintln!("[exit code: {}]", code); }
+    if let Err(e) = protocol::write_message(&mut writer, &msg) {
+        eprintln!("Send failed: {}", e);
+        std::process::exit(1);
+    }
+    match protocol::read_message(&mut reader) {
+        Ok(resp) => {
+            let stdout = json_str_field(&resp, "stdout").unwrap_or_default();
+            let stderr = json_str_field(&resp, "stderr").unwrap_or_default();
+            let code = json_str_field(&resp, "exit_code").unwrap_or_default();
+            if !stdout.is_empty() { print!("{}", stdout); }
+            if !stderr.is_empty() { eprint!("{}", stderr); }
+            if code != "0" && !code.is_empty() { eprintln!("[exit code: {}]", code); }
+        }
+        Err(e) => {
+            eprintln!("Connection lost: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn pilot_push(ip: &str, local_path: &str, remote_path: &str) {
@@ -883,29 +892,18 @@ fn pilot_deploy(ip: &str) {
     );
     let paired_json = format!(r#"["{}"]"#, token);
     {
-        let (mut reader, mut writer) = pilot_connect(ip);
-        let home_cmd = r#"{"type":"exec","id":"1","cmd":"$env:USERPROFILE"}"#;
-        protocol::write_message(&mut writer, home_cmd).unwrap();
-        let resp = protocol::read_message(&mut reader).unwrap();
-        let remote_home = json_str_field(&resp, "stdout").unwrap_or_else(|| r"C:\Users\Public".into());
-        let remote_home = remote_home.trim().trim_end_matches('\r');
-        let config_dir = format!(r"{}\.drive-by-wire", remote_home);
-
-        // Create config dir and write paired.json
+        // Create config dir
         let (mut r2, mut w2) = pilot_connect(ip);
-        let mkdir_cmd = format!(
-            r#"{{"type":"exec","id":"1","cmd":"New-Item -ItemType Directory -Path '{}' -Force | Out-Null"}}"#,
-            config_dir.replace('\\', "\\\\")
-        );
-        protocol::write_message(&mut w2, &mkdir_cmd).unwrap();
+        let mkdir_cmd = r#"{"type":"exec","id":"1","cmd":"New-Item -ItemType Directory -Path ($env:USERPROFILE + '\\.drive-by-wire') -Force | Out-Null"}"#;
+        protocol::write_message(&mut w2, mkdir_cmd).unwrap();
         let _ = protocol::read_message(&mut r2);
 
-        let paired_path = format!(r"{}\paired.json", config_dir);
+        // Push paired.json via push command  
         let paired_data = paired_json.as_bytes();
         let (mut r3, mut w3) = pilot_connect(ip);
         let push_msg = format!(
-            r#"{{"type":"push","id":"1","dest_path":"{}","size":{}}}"#,
-            paired_path.replace('\\', "\\\\"), paired_data.len()
+            r#"{{"type":"push","id":"1","dest_path":"C:\\Users\\hoops\\.drive-by-wire\\paired.json","size":{}}}"#,
+            paired_data.len()
         );
         protocol::write_message(&mut w3, &push_msg).unwrap();
         protocol::write_raw_bytes(&mut w3, paired_data).unwrap();

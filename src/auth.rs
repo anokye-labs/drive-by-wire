@@ -32,13 +32,22 @@ impl Auth {
         &self.pin
     }
 
+    /// Reload tokens from disk (picks up externally-written paired.json).
+    fn reload(&mut self) {
+        if let Ok(contents) = fs::read_to_string(&self.config_path) {
+            self.paired_tokens = parse_string_array(&contents);
+        }
+    }
+
     /// Check if any device has ever been paired.
-    pub fn has_any_paired(&self) -> bool {
+    pub fn has_any_paired(&mut self) -> bool {
+        self.reload();
         !self.paired_tokens.is_empty()
     }
 
     /// Check if a token is already paired (trusted).
-    pub fn is_paired(&self, token: &str) -> bool {
+    pub fn is_paired(&mut self, token: &str) -> bool {
+        self.reload();
         self.paired_tokens.iter().any(|t| t == token)
     }
 
